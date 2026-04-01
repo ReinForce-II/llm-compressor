@@ -134,7 +134,13 @@ class SequentialQwen3_5MoeExperts(torch.nn.ModuleList):
             self[i].gate_proj.weight.data = (
                 gate_up[:intermediate_size, :].clone().contiguous()
             )
+            if self[i].gate_proj.weight.data.abs().max() < 1e-8:
+                self[i].gate_proj.weight.data = torch.rand_like(self[i].gate_proj.weight.data) * 1e-8
             self[i].up_proj.weight.data = (
                 gate_up[intermediate_size:, :].clone().contiguous()
             )
+            if self[i].up_proj.weight.data.abs().max() < 1e-8:
+                self[i].up_proj.weight.data = torch.rand_like(self[i].up_proj.weight.data) * 1e-8
             self[i].down_proj.weight.data = down.clone().contiguous()
+            if self[i].down_proj.weight.data.abs().max() < 1e-8:
+                self[i].down_proj.weight.data = torch.rand_like(self[i].down_proj.weight.data) * 1e-8
