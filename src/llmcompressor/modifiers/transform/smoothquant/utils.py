@@ -1,5 +1,6 @@
 import functools
 from collections import namedtuple
+from collections.abc import Callable
 
 from loguru import logger
 
@@ -82,6 +83,153 @@ AFMOE_SMOOTHQUANT_MAPPINGS: list[LayerMap] = [
     ),
 ]
 
+ModelAwareLayerMapFactory = Callable[[object], list[LayerMap]]
+
+
+def _get_nested_attr(obj: object, path: str):
+    current = obj
+    for part in path.split("."):
+        current = getattr(current, part)
+    return current
+
+
+def _get_qwen3_5_layer_container(model: object) -> tuple[str, object]:
+    for path in (
+        "model.layers",
+        "model.language_model.layers",
+        "language_model.layers",
+        "layers",
+    ):
+        try:
+            return path, _get_nested_attr(model, path)
+        except AttributeError:
+            continue
+
+    raise ValueError("Could not locate decoder layers for Qwen3.5 model")
+
+
+def _get_qwen3_5_input_balance_layers(
+    layer_prefix: str, layer: object
+) -> list[str] | None:
+    if hasattr(layer, "self_attn"):
+        return [
+            f"{layer_prefix}.self_attn.q_proj",
+            f"{layer_prefix}.self_attn.k_proj",
+            f"{layer_prefix}.self_attn.v_proj",
+        ]
+
+    if hasattr(layer, "linear_attn"):
+        return [
+            f"{layer_prefix}.linear_attn.in_proj_qkv",
+            f"{layer_prefix}.linear_attn.in_proj_z",
+            f"{layer_prefix}.linear_attn.in_proj_b",
+            f"{layer_prefix}.linear_attn.in_proj_a",
+        ]
+
+    return None
+
+
+def _get_qwen3_5_dense_layer_mappings(model: object) -> list[LayerMap]:
+    layers_path, layers = _get_qwen3_5_layer_container(model)
+    mappings: list[LayerMap] = []
+
+    for layer_idx, layer in enumerate(layers):
+        layer_prefix = f"{layers_path}.{layer_idx}"
+
+        input_balance_layers = _get_qwen3_5_input_balance_layers(layer_prefix, layer)
+        if input_balance_layers:
+            mappings.append(
+                LayerMap(
+                    balance_layers=input_balance_layers,
+                    smooth_layers=f"{layer_prefix}.input_layernorm",
+                )
+            )
+
+        mlp = getattr(layer, "mlp", None)
+        mlp_balance_layers: list[str] = []
+        if mlp is not None:
+            if hasattr(mlp, "gate_proj"):
+                mlp_balance_layers.append(f"{layer_prefix}.mlp.gate_proj")
+            if hasattr(mlp, "up_proj"):
+                mlp_balance_layers.append(f"{layer_prefix}.mlp.up_proj")
+
+        if mlp_balance_layers:
+            mappings.append(
+                LayerMap(
+                    balance_layers=mlp_balance_layers,
+                    smooth_layers=f"{layer_prefix}.post_attention_layernorm",
+                )
+            )
+
+    return mappings
+
+
+def _get_qwen3_5_moe_layer_mappings(model: object) -> list[LayerMap]:
+    layers_path, layers = _get_qwen3_5_layer_container(model)
+    mappings: list[LayerMap] = []
+
+    for layer_idx, layer in enumerate(layers):
+        layer_prefix = f"{layers_path}.{layer_idx}"
+
+        input_balance_layers = _get_qwen3_5_input_balance_layers(layer_prefix, layer)
+        if input_balance_layers:
+            mappings.append(
+                LayerMap(
+                    balance_layers=input_balance_layers,
+                    smooth_layers=f"{layer_prefix}.input_layernorm",
+                )
+            )
+
+        mlp_balance_layers: list[str] = []
+        mlp = getattr(layer, "mlp", None)
+        if mlp is not None:
+            if hasattr(mlp, "gate"):
+                mlp_balance_layers.append(f"{layer_prefix}.mlp.gate")
+
+            experts = getattr(mlp, "experts", None)
+            if experts is not None:
+                for expert_idx, expert in enumerate(experts):
+                    if hasattr(expert, "gate_proj"):
+                        mlp_balance_layers.append(
+                            f"{layer_prefix}.mlp.experts.{expert_idx}.gate_proj"
+                        )
+                    if hasattr(expert, "up_proj"):
+                        mlp_balance_layers.append(
+                            f"{layer_prefix}.mlp.experts.{expert_idx}.up_proj"
+                        )
+
+            shared_expert = getattr(mlp, "shared_expert", None)
+            if shared_expert is not None:
+                if hasattr(shared_expert, "gate_proj"):
+                    mlp_balance_layers.append(
+                        f"{layer_prefix}.mlp.shared_expert.gate_proj"
+                    )
+                if hasattr(shared_expert, "up_proj"):
+                    mlp_balance_layers.append(
+                        f"{layer_prefix}.mlp.shared_expert.up_proj"
+                    )
+
+            if hasattr(mlp, "shared_expert_gate"):
+                mlp_balance_layers.append(f"{layer_prefix}.mlp.shared_expert_gate")
+
+        if mlp_balance_layers:
+            mappings.append(
+                LayerMap(
+                    balance_layers=mlp_balance_layers,
+                    smooth_layers=f"{layer_prefix}.post_attention_layernorm",
+                )
+            )
+
+    return mappings
+
+
+MODEL_AWARE_MAPPINGS_REGISTRY: dict[str, ModelAwareLayerMapFactory] = {
+    "Qwen3_5ForCausalLM": _get_qwen3_5_dense_layer_mappings,
+    "Qwen3_5ForConditionalGeneration": _get_qwen3_5_dense_layer_mappings,
+    "Qwen3_5MoeForCausalLM": _get_qwen3_5_moe_layer_mappings,
+    "Qwen3_5MoeForConditionalGeneration": _get_qwen3_5_moe_layer_mappings,
+}
+
 
 # Registry of layer mappings for different architectures
 #   Add more mappings here
@@ -107,11 +255,16 @@ MAPPINGS_REGISTRY: dict[str, list[LayerMap]] = {
 }
 
 
-def get_layer_mappings_from_architecture(architecture: str) -> list[LayerMap]:
+def get_layer_mappings_from_architecture(
+    architecture: str, model: object | None = None
+) -> list[LayerMap]:
     """
     :param architecture: str: The architecture of the model
     :return: list: The layer mappings for the given architecture
     """
+
+    if model is not None and architecture in MODEL_AWARE_MAPPINGS_REGISTRY:
+        return MODEL_AWARE_MAPPINGS_REGISTRY[architecture](model)
 
     if architecture not in MAPPINGS_REGISTRY:
         logger.info(
