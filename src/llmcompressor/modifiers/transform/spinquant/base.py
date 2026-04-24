@@ -208,6 +208,13 @@ class SpinQuantModifier(Modifier, use_enum_values=True):
                 fuse_norm_linears(norm[0], tree_leaves(linears))
 
     def _create_r1_scheme(self) -> TransformScheme:
+        token_mixer_out = self.mappings.token_mixer_out or self.mappings.attn_o
+        token_mixer_in = self.mappings.token_mixer_in or [
+            *self.mappings.attn_q,
+            *self.mappings.attn_k,
+            *self.mappings.attn_v,
+        ]
+
         return TransformScheme(
             type=self.transform_type,
             randomize=self.randomize,
@@ -218,16 +225,14 @@ class SpinQuantModifier(Modifier, use_enum_values=True):
                 TransformArgs(
                     targets=[
                         self.mappings.embedding,
-                        self.mappings.attn_o,
+                        *token_mixer_out,
                         *self.mappings.mlp_out,
                     ],
                     location="weight_output",
                 ),
                 TransformArgs(
                     targets=[
-                        self.mappings.attn_q,
-                        self.mappings.attn_k,
-                        self.mappings.attn_v,
+                        *token_mixer_in,
                         *self.mappings.mlp_in,
                         self.mappings.lm_head,
                     ],
@@ -245,9 +250,9 @@ class SpinQuantModifier(Modifier, use_enum_values=True):
             precision=self.precision,
             head_dim=head_dim,
             apply=[
-                TransformArgs(targets=[self.mappings.attn_v], location="weight_output"),
+                TransformArgs(targets=[*self.mappings.attn_v], location="weight_output"),
                 TransformArgs(
-                    targets=[self.mappings.attn_o],
+                    targets=[*self.mappings.attn_o],
                     location="weight_input",
                     inverse=True,
                 ),
@@ -263,11 +268,11 @@ class SpinQuantModifier(Modifier, use_enum_values=True):
             head_dim=head_dim,
             apply=[
                 TransformArgs(
-                    targets=[self.mappings.attn],
+                    targets=[*self.mappings.attn],
                     location="q_attn",
                 ),
                 TransformArgs(
-                    targets=[self.mappings.attn],
+                    targets=[*self.mappings.attn],
                     location="k_cache",
                 ),
             ],
