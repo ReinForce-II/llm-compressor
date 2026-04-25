@@ -10,7 +10,9 @@ from compressed_tensors import QUANTIZATION_CONFIG_NAME, CompressionFormat
 from compressed_tensors.compressors import ModelCompressor
 from compressed_tensors.config import BitmaskConfig, DenseSparsityConfig
 from compressed_tensors.quantization import (
+    QuantizationArgs,
     QuantizationConfig,
+    QuantizationScheme,
     QuantizationStatus,
     quantize,
 )
@@ -838,6 +840,138 @@ class TestGraftExtraWeights:
             grafted = f.get_tensor("extra.w")
 
         assert torch.equal(grafted, tensors["extra.w"])
+
+    def test_quantizes_matching_extra_weights(self, tmp_path):
+        """Extra linear weights should be quantized when they match the save-time
+        quantization config."""
+        from safetensors import safe_open
+
+        all_keys = [
+            "model.layer.weight",
+            "mtp.0.layer.weight",
+            "mtp.0.layer.bias",
+        ]
+        output_keys = ["model.layer.weight"]
+
+        source_dir, tensors = self._make_source_checkpoint(tmp_path, all_keys)
+        out_dir = self._make_output_dir(tmp_path, output_keys, tensors)
+
+        quantization_config = QuantizationConfig(
+            config_groups={
+                "group_0": QuantizationScheme(
+                    targets=[r"re:mtp\..*\.layer"],
+                    weights=QuantizationArgs(
+                        num_bits=4,
+                        type="int",
+                        strategy="group",
+                        group_size=4,
+                        symmetric=True,
+                        dynamic=False,
+                    ),
+                )
+            },
+            quantization_status=QuantizationStatus.COMPRESSED,
+        )
+        compressor = ModelCompressor(quantization_config=quantization_config)
+
+        mock = self._mock_model(source_dir, ["model", "model.layer"])
+        _graft_extra_weights(mock, out_dir, compressor=compressor)
+
+        extra_path = os.path.join(out_dir, "extra_weights.safetensors")
+        assert os.path.exists(extra_path)
+
+        with safe_open(extra_path, framework="pt") as f:
+            extra_keys = set(f.keys())
+            assert extra_keys == {
+                "mtp.0.layer.bias",
+                "mtp.0.layer.weight_packed",
+                "mtp.0.layer.weight_scale",
+                "mtp.0.layer.weight_shape",
+            }
+            assert torch.equal(f.get_tensor("mtp.0.layer.bias"), tensors["mtp.0.layer.bias"])
+
+        index_path = os.path.join(out_dir, "model.safetensors.index.json")
+        with open(index_path) as f:
+            index = json.load(f)
+
+        weight_map = index["weight_map"]
+        assert "mtp.0.layer.weight" not in weight_map
+        assert weight_map["mtp.0.layer.weight_packed"] == "extra_weights.safetensors"
+        assert weight_map["mtp.0.layer.weight_scale"] == "extra_weights.safetensors"
+        assert weight_map["mtp.0.layer.weight_shape"] == "extra_weights.safetensors"
+        assert weight_map["mtp.0.layer.bias"] == "extra_weights.safetensors"
+
+    def test_quantizes_extra_weights_with_multiple_schemes(self, tmp_path):
+        """Extra weights should resolve against their own quantization groups, not a
+        single shared scheme."""
+        from safetensors import safe_open
+
+        all_keys = [
+            "model.layer.weight",
+            "mtp.0.layer.weight",
+            "mtp.1.layer.weight",
+        ]
+        output_keys = ["model.layer.weight"]
+
+        source_dir, tensors = self._make_source_checkpoint(tmp_path, all_keys)
+        out_dir = self._make_output_dir(tmp_path, output_keys, tensors)
+
+        quantization_config = QuantizationConfig(
+            config_groups={
+                "group_0": QuantizationScheme(
+                    targets=[r"re:mtp\.0\.layer"],
+                    weights=QuantizationArgs(
+                        num_bits=4,
+                        type="int",
+                        strategy="group",
+                        group_size=4,
+                        symmetric=True,
+                        dynamic=False,
+                    ),
+                ),
+                "group_1": QuantizationScheme(
+                    targets=[r"re:mtp\.1\.layer"],
+                    weights=QuantizationArgs(
+                        num_bits=8,
+                        type="int",
+                        strategy="channel",
+                        symmetric=True,
+                        dynamic=False,
+                    ),
+                ),
+            },
+            quantization_status=QuantizationStatus.COMPRESSED,
+        )
+        compressor = ModelCompressor(quantization_config=quantization_config)
+
+        mock = self._mock_model(source_dir, ["model", "model.layer"])
+        _graft_extra_weights(mock, out_dir, compressor=compressor)
+
+        extra_path = os.path.join(out_dir, "extra_weights.safetensors")
+        assert os.path.exists(extra_path)
+
+        with safe_open(extra_path, framework="pt") as f:
+            extra_keys = set(f.keys())
+            assert "mtp.0.layer.weight_packed" in extra_keys
+            assert "mtp.0.layer.weight_scale" in extra_keys
+            assert "mtp.1.layer.weight_scale" in extra_keys
+            assert any(
+                key in extra_keys
+                for key in ("mtp.1.layer.weight", "mtp.1.layer.weight_packed")
+            )
+
+        index_path = os.path.join(out_dir, "model.safetensors.index.json")
+        with open(index_path) as f:
+            index = json.load(f)
+
+        weight_map = index["weight_map"]
+        assert "mtp.0.layer.weight" not in weight_map
+        assert "mtp.1.layer.weight" not in weight_map or (
+            weight_map["mtp.1.layer.weight"] == "extra_weights.safetensors"
+        )
+        assert weight_map["mtp.0.layer.weight_packed"] == "extra_weights.safetensors"
+        assert weight_map["mtp.0.layer.weight_scale"] == "extra_weights.safetensors"
+        assert weight_map["mtp.1.layer.weight_scale"] == "extra_weights.safetensors"
 
     def test_total_size_correct_single_shard(self, tmp_path):
         """total_size in the created index should equal tensor byte counts,

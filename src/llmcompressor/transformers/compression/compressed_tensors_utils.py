@@ -1,7 +1,9 @@
 import json
 import os
+import re
 import weakref
-from collections import defaultdict
+from collections import OrderedDict, defaultdict
+from copy import deepcopy
 from functools import wraps
 
 import torch
@@ -12,6 +14,14 @@ from compressed_tensors import (
 )
 from compressed_tensors.config import CompressionFormat
 from compressed_tensors.offload import from_accelerate, is_rank0, to_accelerate
+from compressed_tensors.quantization import (
+    QuantizationConfig,
+    QuantizationScheme,
+    QuantizationStrategy,
+    initialize_module_for_quantization,
+)
+from compressed_tensors.quantization.lifecycle.apply import match_targets
+from compressed_tensors.utils.match import match_name
 from loguru import logger
 from safetensors import safe_open
 from safetensors.torch import save_file
@@ -19,6 +29,13 @@ from transformers import PreTrainedModel
 from transformers.utils import SAFE_WEIGHTS_INDEX_NAME, SAFE_WEIGHTS_NAME
 
 from llmcompressor.core import active_session
+from llmcompressor.modifiers.quantization.calibration import (
+    apply_calibration_status,
+    freeze_module_quantization,
+    initialize_observer,
+    update_weight_global_scale,
+    update_weight_zp_scale,
+)
 from llmcompressor.pytorch.model_load.helpers import copy_python_files_from_model_cache
 from llmcompressor.transformers.compression.sparsity_metadata_config import (
     SparsityConfigMetadata,
@@ -27,6 +44,21 @@ from llmcompressor.transformers.utils import RECIPE_FILE_NAME
 from llmcompressor.transformers.utils.helpers import infer_recipe_from_model_path
 
 __all__ = ["modify_save_pretrained"]
+
+
+_DEFAULT_FUSED_MAPPINGS = [
+    [
+        r"re:.*(attn|attention)\.q_proj\.weight$",
+        r"re:.*(attn|attention)\.k_proj\.weight$",
+        r"re:.*(attn|attention)\.v_proj\.weight$",
+    ],
+    [
+        r"re:.*(attn|attention)\.wq_a\.weight$",
+        r"re:.*(attn|attention)\.wkv_a_with_mqa\.weight$",
+    ],
+    [r"re:.*mlp\.gate_proj\.weight$", r"re:.*mlp\.up_proj\.weight$"],
+    [r"re:.*w1\.weight$", r"re:.*w3\.weight$"],
+]
 
 
 def modify_save_pretrained(model: PreTrainedModel):
@@ -120,7 +152,7 @@ def modify_save_pretrained(model: PreTrainedModel):
 
                 # graft any extra weights (e.g. MTP) from the source checkpoint
                 # that were dropped by transformers during from_pretrained
-                _graft_extra_weights(model, save_directory)
+                _graft_extra_weights(model, save_directory, compressor=compressor)
 
             # convert back from accelerate to restore model to original form
             from_accelerate(model)
@@ -271,7 +303,275 @@ def _update_config_expanded_ignore(
     )
 
 
-def _graft_extra_weights(model: PreTrainedModel, save_directory: str) -> None:
+def _is_quantizable_extra_tensor(name: str, tensor: torch.Tensor) -> bool:
+    if "." not in name:
+        return False
+
+    module_name, param_name = name.rsplit(".", 1)
+    return param_name == "weight" and tensor.ndim == 2 and not module_name.endswith("norm")
+
+
+def _is_tensor_group_scheme(scheme: QuantizationScheme) -> bool:
+    if scheme.weights is None:
+        return False
+
+    strategy = scheme.weights.strategy
+    return strategy in (
+        QuantizationStrategy.TENSOR_GROUP,
+        QuantizationStrategy.TENSOR_GROUP.value,
+    )
+
+
+def _resolve_extra_tensor_schemes(
+    extra_tensors: dict[str, torch.Tensor],
+    quantization_config: QuantizationConfig,
+) -> dict[str, QuantizationScheme]:
+    target_to_scheme: OrderedDict[str, QuantizationScheme] = OrderedDict()
+    for scheme in quantization_config.config_groups.values():
+        for target in scheme.targets:
+            target_to_scheme[target] = scheme
+
+    if not target_to_scheme:
+        return {}
+
+    ignore = quantization_config.ignore or []
+    tensor_schemes: dict[str, QuantizationScheme] = {}
+    for tensor_name, tensor in extra_tensors.items():
+        if not _is_quantizable_extra_tensor(tensor_name, tensor):
+            continue
+
+        module_name, _ = tensor_name.rsplit(".", 1)
+        module = torch.nn.Linear(
+            tensor.shape[1],
+            tensor.shape[0],
+            bias=False,
+            dtype=tensor.dtype,
+        )
+        if match_targets(module_name, module, ignore):
+            continue
+
+        matched_targets = match_targets(module_name, module, target_to_scheme.keys())
+        if not matched_targets:
+            continue
+
+        scheme = target_to_scheme[matched_targets[0]]
+        if scheme.weights is None:
+            continue
+
+        tensor_schemes[tensor_name] = scheme
+
+    return tensor_schemes
+
+
+def _initialize_extra_quantized_linear(
+    tensor: torch.Tensor, scheme: QuantizationScheme
+) -> torch.nn.Linear:
+    out_features, in_features = tensor.shape
+    module = torch.nn.Linear(
+        in_features,
+        out_features,
+        bias=False,
+        device=tensor.device,
+        dtype=tensor.dtype,
+    )
+    module.weight.data.copy_(tensor)
+    initialize_module_for_quantization(
+        module,
+        deepcopy(scheme),
+        force_zero_point=False,
+    )
+    return module
+
+
+def _calibrate_extra_weight_global_scale(module: torch.nn.Linear) -> None:
+    initialize_observer(module, "weight")
+    apply_calibration_status(module)
+    update_weight_global_scale(module)
+    freeze_module_quantization(module)
+
+
+def _calibrate_extra_weight_scale(module: torch.nn.Linear) -> None:
+    initialize_observer(module, "weight")
+    apply_calibration_status(module)
+    update_weight_zp_scale(module)
+    freeze_module_quantization(module)
+
+
+def _match_names_set_eager(
+    names: list[str],
+    targets: list[str],
+) -> tuple[list[dict[str, str | None]], dict[str, str | None] | None]:
+    matched_sets = []
+    matches = dict.fromkeys(targets, None)
+
+    def natural_key(name: str) -> list[str | int]:
+        return [
+            int(part) if part.isdigit() else part for part in re.split(r"(\d+)", name)
+        ]
+
+    for name in sorted(names, key=natural_key):
+        for target in targets:
+            if not match_name(name, target):
+                continue
+
+            if matches[target] is None:
+                matches[target] = name
+            else:
+                raise ValueError(
+                    f"Matched a {target} twice before completing set "
+                    f"({matches[target]}, {name})"
+                )
+
+        if all(matches[target] is not None for target in targets):
+            matched_sets.append(matches)
+            matches = dict.fromkeys(targets, None)
+
+    unmatched = matches if any(value is not None for value in matches.values()) else None
+    return matched_sets, unmatched
+
+
+def _get_extra_fused_names(
+    tensor_names: list[str],
+) -> tuple[list[dict[str, str | None]], list[dict[str, str | None]]]:
+    matched_sets = []
+    unmatched_sets = []
+    for mapping in _DEFAULT_FUSED_MAPPINGS:
+        matched, unmatched = _match_names_set_eager(tensor_names, mapping)
+        matched_sets.extend(matched)
+        if unmatched is not None:
+            unmatched_sets.append(unmatched)
+
+    return matched_sets, unmatched_sets
+
+
+def _replace_extra_weight_with_quantized_state(
+    extra_tensors: dict[str, torch.Tensor],
+    tensor_name: str,
+    module: torch.nn.Linear,
+) -> None:
+    del extra_tensors[tensor_name]
+
+    module_name, _ = tensor_name.rsplit(".", 1)
+    for key, value in module.state_dict(prefix=f"{module_name}.").items():
+        extra_tensors[key] = value.to("cpu")
+
+
+def _compress_extra_quantized_module(
+    module: torch.nn.Linear,
+    compressor: ModelCompressor,
+) -> None:
+    container = torch.nn.Module()
+    container.add_module("layer", module)
+    compressor.compress_model(container)
+
+    # `compressed_tensors` has shipped this cleanup both as a helper method and
+    # as a direct `ct_decompress_hook` attribute on the model.
+    if hasattr(compressor, "remove_decompression_hook"):
+        compressor.remove_decompression_hook(container)
+        return
+
+    hook = getattr(container, "ct_decompress_hook", None)
+    if hook is not None:
+        hook.remove()
+        delattr(container, "ct_decompress_hook")
+
+
+def _quantize_extra_tensors(
+    extra_tensors: dict[str, torch.Tensor],
+    compressor: ModelCompressor | None,
+) -> dict[str, torch.Tensor]:
+    if compressor is None or compressor.quantization_config is None:
+        return extra_tensors
+
+    tensor_schemes = _resolve_extra_tensor_schemes(
+        extra_tensors,
+        compressor.quantization_config,
+    )
+    if not tensor_schemes:
+        return extra_tensors
+
+    quantized_tensors = dict(extra_tensors)
+    processed: set[str] = set()
+
+    tensor_group_names = [
+        tensor_name
+        for tensor_name, scheme in tensor_schemes.items()
+        if _is_tensor_group_scheme(scheme)
+    ]
+    fused_groups: dict[str, list[str]] = {}
+    if tensor_group_names:
+        matched_sets, unmatched_sets = _get_extra_fused_names(tensor_group_names)
+        for unmatched in unmatched_sets:
+            fallback_names = sorted(name for name in unmatched.values() if name is not None)
+            if fallback_names:
+                logger.warning(
+                    "Falling back to per-tensor calibration for {} extra tensor-group weight(s)",
+                    len(fallback_names),
+                )
+
+        for matched in matched_sets:
+            fused_names = [name for name in matched.values() if name is not None]
+            if len(fused_names) < 2:
+                continue
+
+            first_scheme = tensor_schemes[fused_names[0]]
+            if any(tensor_schemes[name] != first_scheme for name in fused_names[1:]):
+                continue
+
+            for name in fused_names:
+                fused_groups[name] = fused_names
+
+    for tensor_name, scheme in tensor_schemes.items():
+        if tensor_name in processed:
+            continue
+
+        fused_names = fused_groups.get(tensor_name)
+        if fused_names is not None:
+            modules = {
+                name: _initialize_extra_quantized_linear(quantized_tensors[name], tensor_schemes[name])
+                for name in fused_names
+            }
+            for module in modules.values():
+                _calibrate_extra_weight_global_scale(module)
+
+            fused_global_scale = torch.min(
+                torch.cat(
+                    [module.weight_global_scale.reshape(-1) for module in modules.values()],
+                    dim=0,
+                )
+            )
+
+            for name, module in modules.items():
+                module.weight_global_scale.data.copy_(
+                    torch.full_like(module.weight_global_scale, fused_global_scale)
+                )
+                _calibrate_extra_weight_scale(module)
+                _compress_extra_quantized_module(module, compressor)
+                _replace_extra_weight_with_quantized_state(quantized_tensors, name, module)
+                processed.add(name)
+
+            continue
+
+        module = _initialize_extra_quantized_linear(quantized_tensors[tensor_name], scheme)
+        if _is_tensor_group_scheme(scheme):
+            _calibrate_extra_weight_global_scale(module)
+
+        _calibrate_extra_weight_scale(module)
+        _compress_extra_quantized_module(module, compressor)
+        _replace_extra_weight_with_quantized_state(quantized_tensors, tensor_name, module)
+        processed.add(tensor_name)
+
+    if processed:
+        logger.info("Quantized {} extra weight tensor(s) during grafting", len(processed))
+
+    return quantized_tensors
+
+
+def _graft_extra_weights(
+    model: PreTrainedModel,
+    save_directory: str,
+    compressor: ModelCompressor | None = None,
+) -> None:
     """
     Copy any weight keys present in the source checkpoint but missing from the
     output directory.  This handles weights that transformers' from_pretrained()
@@ -288,6 +588,9 @@ def _graft_extra_weights(model: PreTrainedModel, save_directory: str) -> None:
     :param model: the model that was loaded and (possibly) quantized
     :param save_directory: path to the output directory produced by
         ``save_pretrained``
+    :param compressor: optional save-time model compressor. If present, extra
+        linear weights that match its quantization config are quantized before
+        being written to ``extra_weights.safetensors``.
     """
     from transformers.utils.hub import cached_file
 
@@ -384,6 +687,8 @@ def _graft_extra_weights(model: PreTrainedModel, save_directory: str) -> None:
             for key in keys:
                 extra_tensors[key] = f.get_tensor(key)
 
+    extra_tensors = _quantize_extra_tensors(extra_tensors, compressor)
+
     # ------------------------------------------------------------------
     # 5. Save extra tensors to a new shard
     # ------------------------------------------------------------------
@@ -403,7 +708,7 @@ def _graft_extra_weights(model: PreTrainedModel, save_directory: str) -> None:
         with open(output_index_path, "r") as f:
             index_data = json.load(f)
 
-        for key in sorted(extra_keys):
+        for key in sorted(extra_tensors):
             index_data["weight_map"][key] = extra_shard_name
 
         metadata = index_data.get("metadata", {})
@@ -426,7 +731,7 @@ def _graft_extra_weights(model: PreTrainedModel, save_directory: str) -> None:
                     t = f.get_tensor(key)
                     original_size += t.nelement() * t.element_size()
 
-        for key in sorted(extra_keys):
+        for key in sorted(extra_tensors):
             weight_map[key] = extra_shard_name
 
         index_data = {
